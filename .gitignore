@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+.env/
+.venv/
+
+# Datasets and outputs
+data/**/*.bin
+out*/
+*.pt
+*.pth
+
+# Weights & Biases
+wandb/
+
+# IDEs
+.idea/
+.vscode/
+
+# OS Specific
+.DS_Store
+Thumbs.db
