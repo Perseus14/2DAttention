@@ -1322,6 +1322,7 @@ def build_cli() -> argparse.ArgumentParser:
     tp.add_argument("--weight_decay",  type=float, default=1e-1)
     tp.add_argument("--use_rope",      action="store_true")
     tp.add_argument("--use_muon",      action="store_true")
+    tp.add_argument("--muon_lr",       type=float, default=0.02)
     tp.add_argument("--eval_interval", type=int, default=500)
     tp.add_argument("--eval_iters",    type=int, default=200)
     tp.add_argument("--log_interval",  type=int, default=10)
@@ -1381,6 +1382,7 @@ def main():
             lr_decay_iters             = args.lr_decay_iters,
             weight_decay               = args.weight_decay,
             use_muon                   = getattr(args, "use_muon", False),
+            muon_lr                    = getattr(args, "muon_lr", 0.02),
             eval_interval              = args.eval_interval,
             eval_iters                 = args.eval_iters,
             log_interval               = args.log_interval,
