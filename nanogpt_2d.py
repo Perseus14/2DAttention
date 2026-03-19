@@ -613,11 +613,16 @@ def precompute_rope_cache(seq_len, head_dim, base=10000.0, device=None):
     return freqs.cos(), freqs.sin()
 
 def apply_rope(x, cos, sin):
+    # x: (B, H, T, d)
     T = x.size(2)
     half = x.size(3) // 2
     x1, x2 = x[..., :half], x[..., half:]
-    cos_t = cos[:T].unsqueeze(0).unsqueeze(0)
-    sin_t = sin[:T].unsqueeze(0).unsqueeze(0)
+    
+    # cos, sin are (T, d/2), need to be expanded to (1, 1, T, d/2) and cast to x.dtype
+    cos_t = cos[:T].unsqueeze(0).unsqueeze(0).to(x.dtype)
+    sin_t = sin[:T].unsqueeze(0).unsqueeze(0).to(x.dtype)
+
+    # Apply RoPE
     return torch.cat([
         x1 * cos_t - x2 * sin_t,
         x2 * cos_t + x1 * sin_t,
