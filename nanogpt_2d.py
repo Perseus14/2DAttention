@@ -77,6 +77,12 @@ class GPTConfig:
     vocab_size: int   = 50304    # GPT-2 BPE vocab (padded to nice multiple)
     dropout:    float = 0.0
     bias:       bool  = False
+    use_rope:   bool  = False
+    rope_base:  float = 10000.0
+    activation: str   = 'relu2'
+    norm_type:  str   = 'rmsnorm'
+    qk_norm:    bool  = True
+    logit_soft_cap: float = 30.0
 
     def __post_init__(self):
         assert self.n_embd % self.n_head == 0, "n_embd must be divisible by n_head"
@@ -114,6 +120,9 @@ class TrainConfig:
     beta1:          float = 0.9
     beta2:          float = 0.95
     grad_clip:      float = 1.0
+    use_muon:       bool  = False
+    muon_lr:        float = 0.02
+    muon_momentum:  float = 0.95
 
     # ── LR schedule (cosine with warmup) ─────────────────────────────────────
     decay_lr:      bool  = True
@@ -557,6 +566,63 @@ class HullKVCache:
         return self.v_buf[idx, self.h_range, :]       # (n_head, head_dim)
 
 
+
+
+# ============================================================================
+# Normalization
+# ============================================================================
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization. Faster than LayerNorm, no bias."""
+    def __init__(self, ndim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.eps = eps
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        return self._norm(x.float()).type_as(x) * self.weight
+
+class LayerNorm(nn.Module):
+    """LayerNorm with optional bias (for GPT-2 compat)."""
+    def __init__(self, ndim, bias=True):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+
+    def forward(self, x):
+        return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
+
+def build_norm(ndim, config):
+    """Create the appropriate normalization layer."""
+    if config.norm_type == 'rmsnorm':
+        return RMSNorm(ndim)
+    return LayerNorm(ndim, bias=config.bias)
+
+# ============================================================================
+# Rotary Position Embeddings (RoPE)
+# ============================================================================
+
+def precompute_rope_cache(seq_len, head_dim, base=10000.0, device=None):
+    assert head_dim % 2 == 0, "head_dim must be even for RoPE"
+    theta = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    t = torch.arange(seq_len, device=device).float()
+    freqs = torch.outer(t, theta)
+    return freqs.cos(), freqs.sin()
+
+def apply_rope(x, cos, sin):
+    T = x.size(2)
+    half = x.size(3) // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    cos_t = cos[:T].unsqueeze(0).unsqueeze(0)
+    sin_t = sin[:T].unsqueeze(0).unsqueeze(0)
+    return torch.cat([
+        x1 * cos_t - x2 * sin_t,
+        x2 * cos_t + x1 * sin_t,
+    ], dim=-1)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 3b. 2-D Causal Self-Attention
 # ──────────────────────────────────────────────────────────────────────────────
@@ -580,6 +646,14 @@ class TwoDCausalSelfAttention(nn.Module):
         self.c_attn  = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_proj  = nn.Linear(config.n_embd, config.n_embd,     bias=config.bias)
 
+        self.qk_norm = config.qk_norm
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+        else:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
+
         self.attn_dropout  = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
@@ -592,13 +666,20 @@ class TwoDCausalSelfAttention(nn.Module):
 
     # ── training forward (full sequence) ─────────────────────────────────────
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rope_cos=None, rope_sin=None) -> torch.Tensor:
         B, T, C = x.shape
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
 
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B,H,T,2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        if rope_cos is not None and rope_sin is not None:
+            q = apply_rope(q, rope_cos, rope_sin)
+            k = apply_rope(k, rope_cos, rope_sin)
 
         # Flash-attention (PyTorch ≥ 2.0) or manual fallback
         if hasattr(F, "scaled_dot_product_attention"):
@@ -625,6 +706,8 @@ class TwoDCausalSelfAttention(nn.Module):
         self,
         x_t: torch.Tensor,    # (1, 1, n_embd)
         cache: HullKVCache,
+        rope_cos=None,
+        rope_sin=None,
     ) -> torch.Tensor:
         """One autoregressive decode step using HullKVCache."""
         assert x_t.shape[:2] == (1, 1)
@@ -632,9 +715,20 @@ class TwoDCausalSelfAttention(nn.Module):
 
         q, k, v = self.c_attn(x_t).split(C, dim=2)  # each (1,1,C)
 
-        q_h = q.view(self.n_head, self.head_dim)     # (H, 2)
-        k_h = k.view(self.n_head, self.head_dim)
-        v_h = v.view(self.n_head, self.head_dim)
+        q_h = q.view(1, 1, self.n_head, self.head_dim).transpose(1, 2)
+        k_h = k.view(1, 1, self.n_head, self.head_dim).transpose(1, 2)
+        v_h = v.view(1, 1, self.n_head, self.head_dim).transpose(1, 2)
+
+        q_h = self.q_norm(q_h)
+        k_h = self.k_norm(k_h)
+
+        if rope_cos is not None and rope_sin is not None:
+            q_h = apply_rope(q_h, rope_cos, rope_sin)
+            k_h = apply_rope(k_h, rope_cos, rope_sin)
+
+        q_h = q_h.transpose(1, 2).squeeze(0).squeeze(0)
+        k_h = k_h.transpose(1, 2).squeeze(0).squeeze(0)
+        v_h = v_h.transpose(1, 2).squeeze(0).squeeze(0)
 
         cache.append(k_h, v_h)   # one D→H transfer (keys only)
         agg = cache.query(q_h)   # one D→H transfer (queries) + one GPU index
@@ -650,21 +744,26 @@ class TwoDCausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
+        self.activation = config.activation
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        return self.dropout(self.c_proj(self.gelu(self.c_fc(x))))
+        x = self.c_fc(x)
+        if self.activation == 'relu2':
+            x = F.relu(x).square()
+        else:
+            x = F.gelu(x)
+        return self.dropout(self.c_proj(x))
 
 
 class Block(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.ln_1 = build_norm(config.n_embd, config)
         self.attn = TwoDCausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.ln_2 = build_norm(config.n_embd, config)
         self.mlp  = MLP(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -732,15 +831,25 @@ class NanoGPT2D(nn.Module):
             f"Sequence length {T} > block_size {self.config.block_size}"
 
         device = idx.device
-        pos    = torch.arange(T, device=device).unsqueeze(0)
+        tok_emb = self.transformer.wte(idx)
 
-        x = self.transformer.drop(
-            self.transformer.wte(idx) + self.transformer.wpe(pos)
-        )
+        if self.config.use_rope:
+            x = self.transformer.drop(tok_emb)
+            rope_cos, rope_sin = self.rope_cos, self.rope_sin
+        else:
+            pos = torch.arange(T, device=device).unsqueeze(0)
+            pos_emb = self.transformer.wpe(pos)
+            x = self.transformer.drop(tok_emb + pos_emb)
+            rope_cos, rope_sin = None, None
+
         for block in self.transformer.h:
-            x = block(x)
-        x      = self.transformer.ln_f(x)
+            x = block(x, rope_cos, rope_sin)
+        x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
+
+        if self.config.logit_soft_cap > 0:
+            cap = self.config.logit_soft_cap
+            logits = cap * torch.tanh(logits / cap)
 
         loss = None
         if targets is not None:
@@ -782,15 +891,24 @@ class NanoGPT2D(nn.Module):
             for _ in self.transformer.h
         ]
 
+        rope_cos = self.rope_cos if cfg.use_rope else None
+        rope_sin = self.rope_sin if cfg.use_rope else None
+
         # ── warm-up: encode the prompt into caches token by token ────────────
         for t in range(idx.size(1)):
             tok = idx[:, t : t + 1]                        # (1,1)
-            pos = torch.tensor([[t]], device=device)
-            x_t = self.transformer.drop(
-                self.transformer.wte(tok) + self.transformer.wpe(pos)
-            )
+            tok_emb = self.transformer.wte(tok)
+            if cfg.use_rope:
+                x_t = self.transformer.drop(tok_emb)
+                r_cos = rope_cos[t:t+1] if rope_cos is not None else None
+                r_sin = rope_sin[t:t+1] if rope_sin is not None else None
+            else:
+                pos = torch.tensor([[t]], device=device)
+                x_t = self.transformer.drop(tok_emb + self.transformer.wpe(pos))
+                r_cos, r_sin = None, None
+
             for i, block in enumerate(self.transformer.h):
-                x_t = block.forward_with_hull(x_t, caches[i])
+                x_t = block.forward_with_hull(x_t, caches[i], r_cos, r_sin)
 
         # ── decode loop ──────────────────────────────────────────────────────
         generated = idx.clone()
@@ -801,15 +919,25 @@ class NanoGPT2D(nn.Module):
                 break
 
             last = generated[:, -1:]                       # (1,1)
-            pos  = torch.tensor([[cur_len - 1]], device=device)
-            x_t  = self.transformer.drop(
-                self.transformer.wte(last) + self.transformer.wpe(pos)
-            )
+            tok_emb = self.transformer.wte(last)
+            if cfg.use_rope:
+                x_t = self.transformer.drop(tok_emb)
+                r_cos = rope_cos[cur_len-1 : cur_len] if rope_cos is not None else None
+                r_sin = rope_sin[cur_len-1 : cur_len] if rope_sin is not None else None
+            else:
+                pos  = torch.tensor([[cur_len - 1]], device=device)
+                x_t  = self.transformer.drop(tok_emb + self.transformer.wpe(pos))
+                r_cos, r_sin = None, None
+                
             for i, block in enumerate(self.transformer.h):
-                x_t = block.forward_with_hull(x_t, caches[i])
+                x_t = block.forward_with_hull(x_t, caches[i], r_cos, r_sin)
 
             x_t    = self.transformer.ln_f(x_t)
-            logits = self.lm_head(x_t[:, -1, :]) / temperature  # (1, V)
+            logits = self.lm_head(x_t[:, -1, :])
+            if cfg.logit_soft_cap > 0:
+                cap = cfg.logit_soft_cap
+                logits = cap * torch.tanh(logits / cap)
+            logits = logits / temperature
 
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -1192,6 +1320,8 @@ def build_cli() -> argparse.ArgumentParser:
     tp.add_argument("--warmup_iters",  type=int,   default=2_000)
     tp.add_argument("--lr_decay_iters", type=int,   default=600_000)
     tp.add_argument("--weight_decay",  type=float, default=1e-1)
+    tp.add_argument("--use_rope",      action="store_true")
+    tp.add_argument("--use_muon",      action="store_true")
     tp.add_argument("--eval_interval", type=int, default=500)
     tp.add_argument("--eval_iters",    type=int, default=200)
     tp.add_argument("--log_interval",  type=int, default=10)
@@ -1235,6 +1365,7 @@ def main():
             block_size = args.block_size,
             vocab_size = args.vocab_size,
             dropout    = args.dropout,
+            use_rope   = getattr(args, "use_rope", False),
         )
         import os
         train_cfg = TrainConfig(
@@ -1249,6 +1380,7 @@ def main():
             warmup_iters               = args.warmup_iters,
             lr_decay_iters             = args.lr_decay_iters,
             weight_decay               = args.weight_decay,
+            use_muon                   = getattr(args, "use_muon", False),
             eval_interval              = args.eval_interval,
             eval_iters                 = args.eval_iters,
             log_interval               = args.log_interval,
@@ -1276,6 +1408,143 @@ def main():
         )
         generate_text(gen_cfg)
 
+
+
+
+# ============================================================================
+# Muon + AdamW Combined Optimizer
+# ============================================================================
+
+class MuonAdamW(torch.optim.Optimizer):
+    def __init__(self, muon_params, adam_params,
+                 muon_lr=0.02, muon_momentum=0.95, muon_weight_decay=0.01,
+                 muon_nesterov=True, muon_ns_steps=5,
+                 adam_betas=(0.9, 0.95), adam_eps=1e-8):
+
+        all_groups = []
+
+        # Muon param group
+        muon_group = dict(
+            params=list(muon_params),
+            lr=muon_lr,
+            base_lr=muon_lr,
+            momentum=muon_momentum,
+            weight_decay=muon_weight_decay,
+            nesterov=muon_nesterov,
+            ns_steps=muon_ns_steps,
+            is_muon=True,
+        )
+        all_groups.append(muon_group)
+
+        # AdamW param groups
+        for g in adam_params:
+            g['is_muon'] = False
+            g['base_lr'] = g.get('lr', 6e-4)
+            g['betas'] = adam_betas
+            g['eps'] = adam_eps
+            all_groups.append(g)
+
+        defaults = dict(lr=muon_lr, weight_decay=0.0, is_muon=False)
+        super().__init__(all_groups, defaults)
+
+    @staticmethod
+    @torch.no_grad()
+    def _newton_schulz(G, steps=5):
+        a, b, c = (3.4445, -4.7750, 2.0315)
+        X = G.bfloat16()
+        transposed = False
+        if X.size(-2) > X.size(-1):
+            X = X.mT
+            transposed = True
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+        for _ in range(steps):
+            A = X @ X.mT
+            B = b * A + c * A @ A
+            X = a * X + B @ X
+        if transposed:
+            X = X.mT
+        return X
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if group.get('is_muon', False):
+                self._muon_step(group)
+            else:
+                self._adam_step(group)
+
+        return loss
+
+    def _muon_step(self, group):
+        lr = group['lr']
+        wd = group['weight_decay']
+        beta = group['momentum']
+        nesterov = group['nesterov']
+        ns_steps = group['ns_steps']
+
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            grad = p.grad
+            state = self.state[p]
+
+            if len(state) == 0:
+                state['momentum_buffer'] = torch.zeros_like(grad)
+
+            buf = state['momentum_buffer']
+            buf.lerp_(grad, 1 - beta)
+
+            if nesterov:
+                update = grad.lerp(buf, beta)
+            else:
+                update = buf
+
+            update = self._newton_schulz(update, steps=ns_steps)
+            scale = (p.size(0) / p.size(1)) ** 0.5
+
+            if wd > 0:
+                p.mul_(1 - lr * wd)
+            p.add_(update.to(p.dtype), alpha=-lr * scale)
+
+    def _adam_step(self, group):
+        lr = group['lr']
+        wd = group.get('weight_decay', 0.0)
+        beta1, beta2 = group['betas']
+        eps = group['eps']
+
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            grad = p.grad.float()
+            state = self.state[p]
+
+            if len(state) == 0:
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(grad)
+                state['exp_avg_sq'] = torch.zeros_like(grad)
+
+            state['step'] += 1
+            exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+
+            exp_avg.lerp_(grad, 1 - beta1)
+            exp_avg_sq.lerp_(grad.square(), 1 - beta2)
+
+            step = state['step']
+            bc1 = 1 - beta1 ** step
+            bc2 = 1 - beta2 ** step
+
+            if wd > 0:
+                p.mul_(1 - lr * wd)
+
+            step_size = lr / bc1
+            denom = (exp_avg_sq / bc2).sqrt().add_(eps)
+            update = exp_avg / denom
+            p.add_(update.to(p.dtype), alpha=-step_size)
 
 if __name__ == "__main__":
     main()

@@ -69,6 +69,9 @@ You can seamlessly override any model or training parameters via command line fl
     --eval_iters 50 \
     --log_interval 10 \
     --weight_decay 0.1 \
+    --use_rope \
+    --use_muon \
+    --muon_lr 0.02 \
     --wandb_log
 ```
 
