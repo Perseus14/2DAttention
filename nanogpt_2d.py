@@ -765,14 +765,19 @@ class Block(nn.Module):
         self.attn = TwoDCausalSelfAttention(config)
         self.ln_2 = build_norm(config.n_embd, config)
         self.mlp  = MLP(config)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x: torch.Tensor, rope_cos=None, rope_sin=None) -> torch.Tensor:
+        x = x + self.attn(self.ln_1(x), rope_cos, rope_sin)
         x = x + self.mlp(self.ln_2(x))
         return x
 
-    def forward_with_hull(self, x_t: torch.Tensor, cache: HullKVCache) -> torch.Tensor:
-        attn_out = self.attn.forward_with_hull(self.ln_1(x_t), cache)
+    def forward_with_hull(
+        self,
+        x_t: torch.Tensor,
+        cache: HullKVCache,
+        rope_cos=None,
+        rope_sin=None,
+    ) -> torch.Tensor:
+        attn_out = self.attn.forward_with_hull(self.ln_1(x_t), cache, rope_cos, rope_sin)
         x_t = x_t + attn_out
         x_t = x_t + self.mlp(self.ln_2(x_t))
         return x_t
@@ -792,15 +797,22 @@ class NanoGPT2D(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte  = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe  = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h    = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embd),
+            ln_f = build_norm(config.n_embd, config),
         ))
+        if not config.use_rope:
+            self.transformer.update({"wpe": nn.Embedding(config.block_size, config.n_embd)})
+            
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # Weight tying (GPT-2 paper)
         self.transformer.wte.weight = self.lm_head.weight
 
+        if config.use_rope:
+            head_dim = config.n_embd // config.n_head
+            cos, sin = precompute_rope_cache(config.block_size, head_dim, config.rope_base)
+            self.register_buffer('rope_cos', cos, persistent=False)
+            self.register_buffer('rope_sin', sin, persistent=False)
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
             if pn.endswith("c_proj.weight"):
