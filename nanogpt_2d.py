@@ -579,11 +579,11 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(ndim))
         self.eps = eps
 
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
     def forward(self, x):
-        return self._norm(x.float()).type_as(x) * self.weight
+        x_fp32 = x.float()
+        rms = torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps)
+        out = (x_fp32 * rms * self.weight.float()).type_as(x)
+        return out
 
 class LayerNorm(nn.Module):
     """LayerNorm with optional bias (for GPT-2 compat)."""
@@ -632,14 +632,25 @@ def apply_rope(x, cos, sin):
 # 3b. 2-D Causal Self-Attention
 # ──────────────────────────────────────────────────────────────────────────────
 
+import torch
+import torch.nn.functional as F
+
 # --- Eager mode SDPA to freeze padding during compilation ---
 @torch.compiler.disable
 def run_padded_flash_attention(q, k, v, pad_size, head_dim, dropout_p, is_causal=True):
     # torch.compile aggressively removes zero-padding as "dead mathematical code", restoring the head_dim=2 shape
     # Disabling compilation here forces the graph to break and invoke the highly optimized C++ FlashAttention kernels explicitly
+    
+    # 1. Pad to size 8
     q_pad = F.pad(q, (0, pad_size))
     k_pad = F.pad(k, (0, pad_size))
     v_pad = F.pad(v, (0, pad_size))
+    
+    # 2. FlashAttention requires inner-most dimension to be strictly contiguous (stride 1)
+    q_pad = q_pad.contiguous()
+    k_pad = k_pad.contiguous()
+    v_pad = v_pad.contiguous()
+    
     y = F.scaled_dot_product_attention(
         q_pad, k_pad, v_pad,
         attn_mask=None,
@@ -647,6 +658,7 @@ def run_padded_flash_attention(q, k, v, pad_size, head_dim, dropout_p, is_causal
         is_causal=is_causal,
     )
     return y[..., :head_dim]
+
 
 class TwoDCausalSelfAttention(nn.Module):
     """
