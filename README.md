@@ -76,7 +76,7 @@ You can seamlessly override any model or training parameters via command line fl
 Generate text using the fully-trained model and the hardware-accelerated Hull KV Cache. You must point `--out_dir` to the exact folder where your checkpoint (`ckpt.pt` or `ckpt_best.pt`) is saved.
 
 ```bash
-./generate.sh --out_dir out-owt-2d/tinystories_7M_run --prompt "Once upon a time," --use_hull
+./generate.sh --out_dir out-owt-2d/tinystories_7M_run --prompt "Once upon a time,"
 ```
 
 ## Requirements
