@@ -681,14 +681,22 @@ class TwoDCausalSelfAttention(nn.Module):
             q = apply_rope(q, rope_cos, rope_sin)
             k = apply_rope(k, rope_cos, rope_sin)
 
-        # Flash-attention (PyTorch ≥ 2.0) or manual fallback
+        # Flash-attention (PyTorch >= 2.0) requires head_dim % 8 == 0.
+        # head_dim=2 forces fallback to Math backend -> allocating (B,H,T,T) = 24GB!
+        # Fix: pad Q,K,V with 6 zeros to head_dim=8, run FlashAttention, and slice back.
+        pad_size = 8 - self.head_dim
+        q_pad = F.pad(q, (0, pad_size))
+        k_pad = F.pad(k, (0, pad_size))
+        v_pad = F.pad(v, (0, pad_size))
+
         if hasattr(F, "scaled_dot_product_attention"):
             y = F.scaled_dot_product_attention(
-                q, k, v,
+                q_pad, k_pad, v_pad,
                 attn_mask=None,
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=True,
             )
+            y = y[..., :self.head_dim]
         else:
             scale = 1.0 / math.sqrt(self.head_dim)
             att = (q @ k.transpose(-2, -1)) * scale
